@@ -59,7 +59,7 @@ models:
     class_name: AbciDialogues
   acn_data_share_dialogues:
     args: {}
-    class_name: AcnDataShareDialogue
+    class_name: AcnDataShareDialogues
   benchmark_tool:
     args:
       log_dir: /logs
@@ -147,6 +147,8 @@ models:
         - - '0x0000000000000000000000000000000000000000'
           - '1'
       service_endpoint_base: https://dummy_service.autonolas.tech/
+      multisend_address: '0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761'
+      cleanup_history_depth: 1
     class_name: Params
   requests:
     args: {}
