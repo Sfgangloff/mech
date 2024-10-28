@@ -64,7 +64,7 @@ models:
     class_name: AbciDialogues
   acn_data_share_dialogues:
     args: {}
-    class_name: AcnDataShareDialogue
+    class_name: AcnDataShareDialogues
   benchmark_tool:
     args:
       log_dir: /logs
@@ -133,7 +133,7 @@ models:
         safe_contract_address: '0x0000000000000000000000000000000000000000'
       share_tm_config_on_startup: false
       sleep_time: 1
-      task_wait_timeout: 15
+      task_wait_timeout: 15.0
       tendermint_check_sleep_delay: 3
       tendermint_com_url: http://localhost:8080
       tendermint_max_retries: 5
@@ -154,6 +154,9 @@ models:
       light_slash_unit_amount: 5000000000000000
       serious_slash_unit_amount: 8000000000000000
       service_endpoint_base: https://dummy_service.autonolas.tech/
+      multisend_address: '0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761'
+      manual_gas_limit: 1000000
+      cleanup_history_depth: 1
     class_name: Params
   requests:
     args: {}
