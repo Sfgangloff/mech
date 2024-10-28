@@ -21,8 +21,35 @@
 
 # pylint: skip-file
 
-import packages.valory.skills.subscription_abci.dialogues  # noqa
+from enum import Enum
+from typing import Type, cast
+from unittest.mock import MagicMock
+
+import pytest
+from aea.protocols.dialogue.base import Dialogues
+from aea.skills.base import Model
+
+from packages.valory.skills.subscription_abci.dialogues import (
+    AcnDataShareDialogue,
+    AcnDataShareDialogues,
+)
 
 
 def test_import() -> None:
     """Test that the 'dialogues.py' Python module can be imported."""
+
+
+@pytest.mark.parametrize(
+    "dialogues_cls,expected_role_from_first_message",
+    [
+        (AcnDataShareDialogues, AcnDataShareDialogue.Role.AGENT),
+    ],
+)
+def test_dialogues_creation(
+    dialogues_cls: Type[Model], expected_role_from_first_message: Enum
+) -> None:
+    """Test XDialogues creations."""
+    dialogues = cast(Dialogues, dialogues_cls(name="", skill_context=MagicMock()))
+    assert expected_role_from_first_message == dialogues._role_from_first_message(
+        MagicMock(), MagicMock()
+    )
