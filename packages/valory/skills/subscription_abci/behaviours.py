@@ -175,7 +175,8 @@ class UpdateSubscriptionBehaviour(BaseSubscriptionBehaviour):
                     f"Could not get subscription update tx for {mech_address}."
                 )
 
-            txs.append(tx)
+            if tx is not None:
+                txs.append(tx)
 
         return txs
 
