@@ -22,14 +22,16 @@ import logging
 import platform
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Generator, Callable, Optional, Type
+from typing import Any, Dict, List, cast, Generator, Callable, Optional, Type
 from unittest import mock
 
 import pytest
 
-# from packages.valory.contracts.agent_mech.contract import (
-#     AgentMechContract,
-# )
+from packages.valory.contracts.hash_checkpoint.contract import HashCheckpointContract
+from packages.valory.contracts.agent_registry.contract import AgentRegistryContract
+from packages.valory.contracts.agent_mech.contract import AgentMechContract
+from packages.valory.contracts.service_registry.contract import ServiceRegistryContract
+
 # from packages.valory.contracts.multisend.contract import (
 #     MultiSendContract,
 # )
@@ -41,10 +43,12 @@ from packages.valory.skills.task_submission_abci.behaviours import (
 from packages.valory.skills.task_submission_abci.rounds import (
     Event,
     SynchronizedData,
+    FinishedTaskPoolingRound,
     FinishedWithoutTasksRound,
 )
 from packages.valory.contracts.gnosis_safe.contract import GnosisSafeContract
 from packages.valory.protocols.contract_api import ContractApiMessage
+from packages.valory.protocols.ledger_api import LedgerApiMessage
 from packages.valory.protocols.contract_api.custom_types import RawTransaction, State
 from packages.valory.skills.abstract_round_abci.base import AbciAppDB
 from packages.valory.skills.abstract_round_abci.behaviours import (
@@ -57,9 +61,15 @@ from packages.valory.skills.abstract_round_abci.test_tools.base import (
 from packages.valory.skills.task_submission_abci import PUBLIC_ID
 
 
-SAFE_CONTRACT_ADDRESS = "0x8969Bd87b9e743d8120e41445462F0cBE29f5D7C"
-# MECH_ADDRESS = "0x77af31De935740567Cf4fF1986D04B2c964A786a"
+SAFE_CONTRACT_ADDRESS = "0x5e1D1eb61E1164D5a50b28C575dA73A29595dFf7"
+HASH_CHECKPOINT_ADDRESS = "0x694e62BDF7Ff510A4EE66662cf4866A961a31653"
+MECH_ADDRESS = "0x77af31De935740567Cf4fF1986D04B2c964A786a"
+SERVICE_REGISTRY_ADDRESS = "0x9338b5153AE39BB89f50468E608eD9d764B755fD"
+AGENT_REGISTRY_ADDRESS = "0xE49CB081e8d96920C38aA7AB90cb0294ab4Bc8EA"
 MULTISEND_ADDRESS = "0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761"
+ZERO_IPFS_HASH = (
+    "f017012200000000000000000000000000000000000000000000000000000000000000000"
+)
 
 
 def test_skill_public_id() -> None:
@@ -280,11 +290,435 @@ class TestTaskPoolingBehaviour(BaseTaskSubmissionTest):
         # `error: Item "None" of "Optional[BaseBehaviour]" has no attribute "context"` when accessing the context below
         assert self.behaviour.current_behaviour is not None
 
-        with mock.patch.object(
-            self.behaviour.current_behaviour.context.logger, "log"
-        ) as mock_logger, self.dummy_get_done_tasks_wrapper(
-            tasks=test_case.initial_data["done_tasks"]
-        ), self.dummy_remove_tasks_wrapper():
+        with (
+            mock.patch.object(
+                self.behaviour.current_behaviour.context.logger, "log"
+            ) as mock_logger,
+            self.dummy_get_done_tasks_wrapper(
+                tasks=test_case.initial_data["done_tasks"]
+            ),
+            self.dummy_remove_tasks_wrapper(),
+        ):
+            self.behaviour.act_wrapper()
+
+            # apply the OK mocks first
+            for ok_req in test_case.ok_reqs:
+                ok_req(self)
+
+            # apply the failing mocks
+            for err_req in test_case.err_reqs:
+                err_req(self, error=True)
+
+            assert len(test_case.expected_logs) == len(test_case.expected_log_levels)
+
+            for log, log_level in zip(
+                test_case.expected_logs, test_case.expected_log_levels
+            ):
+
+                log_found = False
+                for log_args in mock_logger.call_args_list:
+                    if platform.python_version().startswith("3.7"):
+                        actual_log_level, actual_log = log_args[0][:2]
+                    else:
+                        actual_log_level, actual_log = log_args.args[:2]
+
+                    if str(actual_log).startswith(log):
+                        assert actual_log_level == log_level, (
+                            f"{log} was expected to log on {log_level} log level, "
+                            f"but logged on {log_args[0]} instead."
+                        )
+                        log_found = True
+                        break
+
+                if not log_found:
+                    raise AssertionError(
+                        f'Expected log message "{log}" was not found in captured logs: '
+                        f"{mock_logger.call_args_list}."
+                    )
+
+        if len(test_case.err_reqs) == 0:
+            # no mocked requests fail,
+            # the behaviour should complete
+            self.complete(test_case.event, test_case.next_behaviour_class)
+
+
+class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
+    """Tests TransactionPreparationBehaviour"""
+
+    behaviour_class = TransactionPreparationBehaviour
+
+    _SAFE_OWNERS = ["0x1", "0x2", "0x3", "0x4"]
+    _AGENTS = ["0x5", "0x6", "0x7", "0x8"]
+    _NUM_SAFE_OWNERS = len(_SAFE_OWNERS)
+    _SAFE_THRESHOLD = 1
+    _INITIAL_DATA: Dict[str, Any] = dict(
+        all_participants=_SAFE_OWNERS,
+        safe_contract_address=SAFE_CONTRACT_ADDRESS,
+        participants=_SAFE_OWNERS,
+        consensus_threshold=3,
+    )
+    _MOCK_TX_RESPONSE = b"0xIrrelevantForTests".hex()
+    _MOCK_TX_HASH = "0x" + "0" * 64
+    _MOCK_ENCODE_DATA = "0x" + "0" * 64
+    _MOCK_CHECKPOINT_DATA = cast(
+        bytes, "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    )
+    _MOCK_BALANCE = 1e18
+    _MOCK_SERVICE_OWNER = "0x15bd56669F57192a97dF41A2aa8f4403e9491776"
+    _MOCK_OPERATORS_MAPPING = dict(zip(_SAFE_OWNERS, _AGENTS))
+    _MOCK_TOKEN_HASH = cast(
+        bytes, "0x714ef7dafa358c7152f6703dd764a1df40d369dcf53275dd2543b0fdbf207298"
+    )
+    _MOCK_IPFS_HASH = (
+        "f0170122043807431fe61981e7177a204e872a55069f4c9d9bfb118f1096ee79025c223ed"
+    )
+
+    @property
+    def state(self) -> TransactionPreparationBehaviour:
+        """Current behavioural state"""
+        return cast(TransactionPreparationBehaviour, self.behaviour.current_behaviour)
+
+    @property
+    def mocked_metadata_hash(self) -> mock._patch_dict:
+        """Mocked configured metadata hash address"""
+        return mock.patch.dict(
+            self.state.params.__dict__,
+            {"metadata_hash": self._MOCK_IPFS_HASH},
+        )
+
+    @property
+    def mocked_agent_registry_address(self) -> mock._patch_dict:
+        """Mocked agent registry address"""
+        return mock.patch.dict(
+            self.state.params.__dict__,
+            {"agent_registry_address": AGENT_REGISTRY_ADDRESS},
+        )
+
+    @property
+    def mocked_service_registry_address(self) -> mock._patch_dict:
+        """Mocked service registry address"""
+        return mock.patch.dict(
+            self.state.params.__dict__,
+            {"service_registry_address": SERVICE_REGISTRY_ADDRESS},
+        )
+
+    @property
+    def mocked_hash_checkpoint_address(self) -> mock._patch_dict:
+        """Mocked hash checkpoint address"""
+        return mock.patch.dict(
+            self.state.params.__dict__,
+            {"hash_checkpoint_address": HASH_CHECKPOINT_ADDRESS},
+        )
+
+    _GET_CONTRACT_REQUEST_ERR = "{func_name} unsuccessful!:"
+    _SHOULD_UPDATE_HASH_WARN = "Could not get latest hash. Don't update the metadata."
+    _DELIVERY_REPORT_WARN = "Could not get current usage."
+    _NUM_REQS_AGENT_WARN = "Could not get delivery report. Don't split profits."
+    _NUM_REQS_AGENT_DELIVERED_WARN = (
+        "Could not get number of requests delivered. Don't split profits."
+    )
+    _SHOULD_SPLIT_PROFITS_INFO = "Not splitting profits."
+
+    # DeliverBehaviour mocks
+    def _mock_get_latest_hash_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the HashCheckpointContract.get_latest_hash"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._IPFS_HASH)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(HashCheckpointContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=HASH_CHECKPOINT_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    # FundsSplittingBehaviour mocks
+    def _mock_get_balance_ledger_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the get_balance"""
+
+        if not error:
+            response_performative = LedgerApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_BALANCE)
+        else:
+            response_performative = LedgerApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_ledger_api_request(
+            request_kwargs=dict(
+                performative=LedgerApiMessage.Performative.GET_STATE,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    def _mock_get_exec_tx_data_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the AgentMechContract.get_exec_tx_data"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_TX_HASH)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(AgentMechContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=MECH_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    def _mock_get_service_owner_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the ServiceRegistryContract.get_service_owner"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_SERVICE_OWNER)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(ServiceRegistryContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=SERVICE_REGISTRY_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    def _mock_get_operators_mapping_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the ServiceRegistryContract.get_operators_mapping"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_OPERATORS_MAPPING)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(ServiceRegistryContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=SERVICE_REGISTRY_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    # TrackingBehaviour mocks
+    def _mock_get_checkpoint_data_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the HashCheckpointContract.get_checkpoint_data"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_CHECKPOINT_DATA)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(HashCheckpointContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=HASH_CHECKPOINT_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    # HashUpdateBehaviour mocks
+    def _mock_get_token_hash_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the AgentRegistryContract.get_token_hash"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_TOKEN_HASH)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(AgentRegistryContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=AGENT_REGISTRY_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    def _mock_get_update_hash_tx_data_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the AgentRegistryContract.get_update_hash_tx_data"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_ENCODE_DATA)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(AgentRegistryContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=AGENT_REGISTRY_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
+    test_cases = [
+        BehaviourTestCase(
+            name="Get Update Tx hash fails",
+            initial_data=_INITIAL_DATA,
+            ok_reqs=[],
+            err_reqs=[_mock_get_token_hash_contract_request],
+            expected_logs=[
+                _GET_CONTRACT_REQUEST_ERR.format(func_name="get_token_hash"),
+                _SHOULD_UPDATE_HASH_WARN,
+            ],
+            expected_log_levels=[logging.WARNING, logging.WARNING],
+            event=Event.DONE,
+            next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
+        ),
+        BehaviourTestCase(
+            name="Get Update Tx hash success and Get Update hash tx data fails",
+            initial_data=_INITIAL_DATA,
+            ok_reqs=[_mock_get_token_hash_contract_request],
+            err_reqs=[_mock_get_update_hash_tx_data_contract_request],
+            expected_logs=[
+                _GET_CONTRACT_REQUEST_ERR.format(func_name="get_mech_update_hash")
+            ],
+            expected_log_levels=[logging.WARNING],
+            event=Event.DONE,
+            next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
+        ),
+        BehaviourTestCase(
+            name="get_mech_update_hash_tx success, get_latest_hash fails",
+            initial_data=_INITIAL_DATA,
+            ok_reqs=[
+                _mock_get_token_hash_contract_request,
+                _mock_get_update_hash_tx_data_contract_request,
+            ],
+            err_reqs=[_mock_get_latest_hash_contract_request],
+            expected_logs=[
+                _GET_CONTRACT_REQUEST_ERR.format(func_name="get_latest_hash"),
+                _DELIVERY_REPORT_WARN,
+                _NUM_REQS_AGENT_WARN,
+                _NUM_REQS_AGENT_DELIVERED_WARN,
+                _SHOULD_SPLIT_PROFITS_INFO,
+            ],
+            expected_log_levels=[
+                logging.WARNING,
+                logging.WARNING,
+                logging.WARNING,
+                logging.WARNING,
+                logging.INFO,
+            ],
+            event=Event.DONE,
+            next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
+        ),
+    ]
+
+    @pytest.mark.parametrize(
+        "test_case",
+        test_cases,
+        ids=[test_case.name for test_case in test_cases],
+    )
+    def test_run(self, test_case: BehaviourTestCase) -> None:
+        """Test multiple paths"""
+        self.fast_forward(data=test_case.initial_data)
+        # repeating this check for the `current_behaviour` here to avoid `mypy` reporting:
+        # `error: Item "None" of "Optional[BaseBehaviour]" has no attribute "context"` when accessing the context below
+        assert self.behaviour.current_behaviour is not None
+
+        with (
+            mock.patch.object(
+                self.behaviour.current_behaviour.context.logger, "log"
+            ) as mock_logger,
+            self.mocked_metadata_hash,
+            self.mocked_agent_registry_address,
+            self.mocked_service_registry_address,
+            self.mocked_hash_checkpoint_address,
+        ):
             self.behaviour.act_wrapper()
 
             # apply the OK mocks first
