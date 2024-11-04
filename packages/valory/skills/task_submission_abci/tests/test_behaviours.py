@@ -20,6 +20,7 @@
 """Test the behaviours.py module of the skill."""
 import logging
 import platform
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, cast, Generator, Callable, Optional, Type
@@ -45,6 +46,7 @@ from packages.valory.skills.task_submission_abci.rounds import (
     SynchronizedData,
     FinishedTaskPoolingRound,
     FinishedWithoutTasksRound,
+    FinishedTaskExecutionWithErrorRound,
 )
 from packages.valory.contracts.gnosis_safe.contract import GnosisSafeContract
 from packages.valory.protocols.contract_api import ContractApiMessage
@@ -372,6 +374,55 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
     _MOCK_IPFS_HASH = (
         "f0170122043807431fe61981e7177a204e872a55069f4c9d9bfb118f1096ee79025c223ed"
     )
+    _MOCK_IPFS_DATA = dict(
+        zip(
+            _AGENTS,
+            [
+                dict({"tool_1": 10, "tool_2": 4, "tool_3": 1, "tool_4": 1111}),
+                dict({"tool_1": 1, "tool_2": 9, "tool_3": 10, "tool_4": 43}),
+                dict({"tool_1": 5, "tool_2": 15, "tool_3": 2, "tool_4": 55}),
+                dict({"tool_1": 8, "tool_2": 2, "tool_3": 6, "tool_4": 38}),
+            ],
+        )
+    )
+    _DUMMY_DONE_TASKS = [
+        {
+            "request_id": 1,
+            "task_executor_address": _AGENTS[0],
+            "tool": "tool_1",
+            "mech_address": MECH_ADDRESS,
+            "is_marketplace_mech": False,
+            "task_result": "result_1",
+            "request_id_nonce": 1,
+        },
+        {
+            "request_id": 2,
+            "task_executor_address": _AGENTS[1],
+            "tool": "tool_2",
+            "mech_address": MECH_ADDRESS,
+            "is_marketplace_mech": False,
+            "task_result": "result_2",
+            "request_id_nonce": 1,
+        },
+        {
+            "request_id": 3,
+            "task_executor_address": _AGENTS[2],
+            "tool": "tool_3",
+            "mech_address": MECH_ADDRESS,
+            "is_marketplace_mech": False,
+            "task_result": "result_3",
+            "request_id_nonce": 1,
+        },
+        {
+            "request_id": 4,
+            "task_executor_address": _AGENTS[3],
+            "tool": "tool_4",
+            "mech_address": MECH_ADDRESS,
+            "is_marketplace_mech": False,
+            "task_result": "result_4",
+            "request_id_nonce": 1,
+        },
+    ]
 
     @property
     def state(self) -> TransactionPreparationBehaviour:
@@ -410,6 +461,19 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
             {"hash_checkpoint_address": HASH_CHECKPOINT_ADDRESS},
         )
 
+    def mocked_profit_split_freq(self, value) -> mock._patch_dict:
+        """Mocked profit_split_freq param"""
+        return mock.patch.dict(
+            self.state.params.__dict__,
+            {"profit_split_freq": value},
+        )
+
+    def regex_search(self, expected_log, actual_log):
+        if re.search(expected_log, actual_log):
+            return True
+        else:
+            return False
+
     _GET_CONTRACT_REQUEST_ERR = "{func_name} unsuccessful!:"
     _SHOULD_UPDATE_HASH_WARN = "Could not get latest hash. Don't update the metadata."
     _DELIVERY_REPORT_WARN = "Could not get current usage."
@@ -417,7 +481,31 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
     _NUM_REQS_AGENT_DELIVERED_WARN = (
         "Could not get number of requests delivered. Don't split profits."
     )
-    _SHOULD_SPLIT_PROFITS_INFO = "Not splitting profits."
+    _SHOULD_NOT_SPLIT_PROFITS_INFO = "Not splitting profits."
+    _IPFS_USAGE_DATA_WARN = "Could not get usage data from IPFS:"
+    _SHOULD_SPLIT_PROFITS_INFO = "Splitting profits"
+    _GET_BALANCE_ERR = (
+        r"Could not get profits from mech 0x[a-fA-F0-9]{40}\. Don't split profits."
+    )
+    _GET_BALANCE_SUCCESS = (
+        r"Got (-?\d+(\.\d+)?|(-?\d+e[+-]?\d+)) profits from mech 0x[a-fA-F0-9]{40}"
+    )
+    _GET_SERVICE_OWNER_WARN = "Could not get service owner. Don't split profits."
+    _SPLIT_FUNDS_ERR = (
+        r"Could not split profits from mech 0x[a-fA-F0-9]{40}\. Don't split profits."
+    )
+
+    def wrap_dummy_get_from_ipfs(self, data: Optional[Any]) -> Callable:
+        """Wrap dummy_get_from_ipfs."""
+
+        def dummy_get_from_ipfs(
+            *args: Any, **kwargs: Any
+        ) -> Generator[None, None, Optional[Any]]:
+            """A mock get_from_ipfs."""
+            return data
+            yield
+
+        return dummy_get_from_ipfs
 
     # DeliverBehaviour mocks
     def _mock_get_latest_hash_contract_request(
@@ -428,7 +516,7 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
 
         if not error:
             response_performative = ContractApiMessage.Performative.STATE
-            response_body = dict(data=self._IPFS_HASH)
+            response_body = dict(data=self._MOCK_IPFS_HASH)
         else:
             response_performative = ContractApiMessage.Performative.ERROR
             response_body = dict()
@@ -457,7 +545,7 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
 
         if not error:
             response_performative = LedgerApiMessage.Performative.STATE
-            response_body = dict(data=self._MOCK_BALANCE)
+            response_body = dict(get_balance_result=self._MOCK_BALANCE)
         else:
             response_performative = LedgerApiMessage.Performative.ERROR
             response_body = dict()
@@ -645,6 +733,35 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
             ),
         )
 
+    # TransactionPreparationBehaviour mocks
+    def _mock_get_deliver_data_contract_request(
+        self,
+        error: bool = False,
+    ) -> None:
+        """Mock the AgentMechContract.get_deliver_data"""
+
+        if not error:
+            response_performative = ContractApiMessage.Performative.STATE
+            response_body = dict(data=self._MOCK_TX_RESPONSE, simulation_ok=True)
+        else:
+            response_performative = ContractApiMessage.Performative.ERROR
+            response_body = dict()
+
+        self.mock_contract_api_request(
+            contract_id=str(AgentMechContract.contract_id),
+            request_kwargs=dict(
+                performative=ContractApiMessage.Performative.GET_STATE,
+                contract_address=MECH_ADDRESS,
+            ),
+            response_kwargs=dict(
+                performative=response_performative,
+                state=State(
+                    ledger_id="ethereum",
+                    body=response_body,
+                ),
+            ),
+        )
+
     test_cases = [
         BehaviourTestCase(
             name="Get Update Tx hash fails",
@@ -684,7 +801,7 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
                 _DELIVERY_REPORT_WARN,
                 _NUM_REQS_AGENT_WARN,
                 _NUM_REQS_AGENT_DELIVERED_WARN,
-                _SHOULD_SPLIT_PROFITS_INFO,
+                _SHOULD_NOT_SPLIT_PROFITS_INFO,
             ],
             expected_log_levels=[
                 logging.WARNING,
@@ -692,6 +809,107 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
                 logging.WARNING,
                 logging.WARNING,
                 logging.INFO,
+            ],
+            event=Event.DONE,
+            next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
+        ),
+        BehaviourTestCase(
+            name="get_mech_update_hash_tx success, get_latest_hash success, ipfs fails",
+            initial_data=_INITIAL_DATA
+            | {
+                "done_tasks": _DUMMY_DONE_TASKS,
+            },
+            ok_reqs=[
+                _mock_get_token_hash_contract_request,
+                _mock_get_update_hash_tx_data_contract_request,
+                _mock_get_latest_hash_contract_request,
+            ],
+            err_reqs=[_mock_get_deliver_data_contract_request],
+            expected_logs=[
+                _IPFS_USAGE_DATA_WARN,
+                _DELIVERY_REPORT_WARN,
+                _NUM_REQS_AGENT_WARN,
+                _NUM_REQS_AGENT_DELIVERED_WARN,
+                _SHOULD_NOT_SPLIT_PROFITS_INFO,
+                _GET_CONTRACT_REQUEST_ERR.format(func_name="get_deliver_data"),
+            ],
+            expected_log_levels=[
+                logging.WARNING,
+                logging.WARNING,
+                logging.WARNING,
+                logging.WARNING,
+                logging.INFO,
+                logging.WARNING,
+            ],
+            event=Event.ERROR,
+            next_behaviour_class=make_degenerate_behaviour(
+                FinishedTaskExecutionWithErrorRound
+            ),
+        ),
+        BehaviourTestCase(
+            name="get_mech_update_hash_tx success, get_latest_hash success, ipfs success",
+            initial_data=_INITIAL_DATA
+            | {"done_tasks": _DUMMY_DONE_TASKS, "ipfs_response": _MOCK_IPFS_DATA},
+            ok_reqs=[
+                _mock_get_token_hash_contract_request,
+                _mock_get_update_hash_tx_data_contract_request,
+                _mock_get_latest_hash_contract_request,
+            ],
+            err_reqs=[_mock_get_deliver_data_contract_request],
+            expected_logs=[],
+            expected_log_levels=[],
+            event=Event.ERROR,
+            next_behaviour_class=make_degenerate_behaviour(
+                FinishedTaskExecutionWithErrorRound
+            ),
+        ),
+        BehaviourTestCase(
+            name="get_mech_update_hash_tx success, _should_split_profits success, balance fails",
+            initial_data=_INITIAL_DATA
+            | {
+                "done_tasks": _DUMMY_DONE_TASKS,
+                "ipfs_response": _MOCK_IPFS_DATA,
+                "profit_split_freq": 1,
+            },
+            ok_reqs=[
+                _mock_get_token_hash_contract_request,
+                _mock_get_update_hash_tx_data_contract_request,
+                _mock_get_latest_hash_contract_request,
+            ],
+            err_reqs=[_mock_get_balance_ledger_request],
+            expected_logs=[_SHOULD_SPLIT_PROFITS_INFO, _GET_BALANCE_ERR],
+            expected_log_levels=[logging.INFO, logging.ERROR],
+            event=Event.DONE,
+            next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
+        ),
+        BehaviourTestCase(
+            name="get_mech_update_hash_tx success, _should_split_profits success, balance success, service owner fails",
+            initial_data=_INITIAL_DATA
+            | {
+                "done_tasks": _DUMMY_DONE_TASKS,
+                "ipfs_response": _MOCK_IPFS_DATA,
+                "profit_split_freq": 1,
+            },
+            ok_reqs=[
+                _mock_get_token_hash_contract_request,
+                _mock_get_update_hash_tx_data_contract_request,
+                _mock_get_latest_hash_contract_request,
+                _mock_get_balance_ledger_request,
+            ],
+            err_reqs=[_mock_get_service_owner_contract_request],
+            expected_logs=[
+                _SHOULD_SPLIT_PROFITS_INFO,
+                _GET_BALANCE_SUCCESS,
+                _GET_CONTRACT_REQUEST_ERR.format(func_name="get_service_owner"),
+                _GET_SERVICE_OWNER_WARN,
+                _SPLIT_FUNDS_ERR,
+            ],
+            expected_log_levels=[
+                logging.INFO,
+                logging.INFO,
+                logging.WARNING,
+                logging.WARNING,
+                logging.ERROR,
             ],
             event=Event.DONE,
             next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
@@ -718,6 +936,16 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
             self.mocked_agent_registry_address,
             self.mocked_service_registry_address,
             self.mocked_hash_checkpoint_address,
+            mock.patch.object(
+                BaseBehaviour,
+                "get_from_ipfs",
+                side_effect=self.wrap_dummy_get_from_ipfs(
+                    test_case.initial_data.get("ipfs_response", None)
+                ),
+            ),
+            self.mocked_profit_split_freq(
+                value=test_case.initial_data.get("profit_split_freq", 1000)
+            ),
         ):
             self.behaviour.act_wrapper()
 
@@ -742,7 +970,9 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
                     else:
                         actual_log_level, actual_log = log_args.args[:2]
 
-                    if str(actual_log).startswith(log):
+                    if str(actual_log).startswith(log) or self.regex_search(
+                        log, actual_log
+                    ):
                         assert actual_log_level == log_level, (
                             f"{log} was expected to log on {log_level} log level, "
                             f"but logged on {log_args[0]} instead."
