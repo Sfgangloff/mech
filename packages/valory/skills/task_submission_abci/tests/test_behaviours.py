@@ -495,6 +495,8 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
         r"Could not split profits from mech 0x[a-fA-F0-9]{40}\. Don't split profits."
     )
 
+    _GET_OPERATOR_MAPPING_UNSUCCESSFUL = "get_operators_mapping unsuccessful!:"
+
     def wrap_dummy_get_from_ipfs(self, data: Optional[Any]) -> Callable:
         """Wrap dummy_get_from_ipfs."""
 
@@ -914,6 +916,26 @@ class TestTransactionPreparationBehaviour(BaseTaskSubmissionTest):
             event=Event.DONE,
             next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
         ),
+        BehaviourTestCase(
+            name="get_operators_mapping fails",
+            initial_data=_INITIAL_DATA
+            | {
+                "done_tasks": _DUMMY_DONE_TASKS,
+                "ipfs_response": _MOCK_IPFS_DATA,
+                "profit_split_freq": 1,
+            },
+            ok_reqs=[
+            ],
+            err_reqs=[_mock_get_operators_mapping_contract_request],
+            expected_logs=[
+                _GET_OPERATOR_MAPPING_UNSUCCESSFUL
+            ],
+            expected_log_levels=[
+                logging.WARNING
+            ],
+            event=Event.DONE,
+            next_behaviour_class=make_degenerate_behaviour(FinishedTaskPoolingRound),
+        )
     ]
 
     @pytest.mark.parametrize(
